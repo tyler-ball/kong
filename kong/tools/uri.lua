@@ -9,7 +9,6 @@ local string_byte = string.byte
 local string_format = string.format
 local tonumber = tonumber
 local table_concat = table.concat
-local table_clear = require("table.clear")
 local ngx_re_gsub = ngx.re.gsub
 
 
@@ -35,15 +34,13 @@ local RESERVED_CHARACTERS = {
   [0x5D] = true, -- ]
 }
 local TMP_OUTPUT = require("table.new")(16, 0)
-local DOT = string_byte(".")
-local SLASH = string_byte("/")
+local EMPTY = ""
+local SLASH = "/"
+local DOT_BYTE = string_byte(".")
+local SLASH_BYTE = string_byte(SLASH)
 
 
-function _M.normalize(uri, merge_slashes)
-  table_clear(TMP_OUTPUT)
-
-  -- Decoding percent-encoded triplets of unreserved characters
-  uri = ngx_re_gsub(uri, "%([\\dA-F]{2})", function(m)
+local function percent_decode(m)
     local hex = m[1]
     local num = tonumber(hex, 16)
     if RESERVED_CHARACTERS[num] then
@@ -51,70 +48,157 @@ function _M.normalize(uri, merge_slashes)
     end
 
     return string_char(num)
-  end, "joi")
+end
 
-  local output_n = 0
 
-  while #uri > 0 do
-    local FIRST = string_byte(uri, 1)
-    local SECOND = string_byte(uri, 2)
-    local THIRD = string_byte(uri, 3)
-    local FOURTH = string_byte(uri, 4)
+local function escape(m)
+  return string_format("%%%02X", string_byte(m[0]))
+end
 
-    if uri == "/." then -- /.
-      uri = "/"
 
-    elseif uri == "/.." then -- /..
-      uri = "/"
-      if output_n > 0 then
-        output_n = output_n - 1
-      end
+function _M.normalize(uri, merge_slashes)
+  -- check for simple cases and early exit
+  if uri == EMPTY or uri == SLASH then
+    return uri
+  end
 
-    elseif uri == "." or uri == ".." then
-      uri = ""
+  -- check if uri needs to be percent-decoded
+  -- (this can in some cases lead to unnecessary percent-decoding)
+  if string_find(uri, "%", 1, true) then
+    -- decoding percent-encoded triplets of unreserved characters
+    uri = ngx_re_gsub(uri, "%([\\dA-F]{2})", percent_decode, "joi")
+  end
 
-    elseif FIRST == DOT and SECOND == DOT and THIRD == SLASH then -- ../
-      uri = string_sub(uri, 4)
+  -- check if the uri contains a dot
+  -- (this can in some cases lead to unnecessary dot removal processing)
+  if string_find(uri, ".", 1, true) == nil  then
+    if not merge_slashes then
+      return uri
+    end
 
-    elseif FIRST == DOT and SECOND == SLASH then -- ./
-      uri = string_sub(uri, 3)
-
-    elseif FIRST == SLASH and SECOND == DOT and THIRD == SLASH then -- /./
-      uri = string_sub(uri, 3)
-
-    elseif FIRST == SLASH and SECOND == DOT and THIRD == DOT and FOURTH == SLASH then -- /../
-      uri = string_sub(uri, 4)
-      if output_n > 0 then
-        output_n = output_n - 1
-      end
-
-    elseif merge_slashes and FIRST == SLASH and SECOND == SLASH then -- //
-      uri = string_sub(uri, 2)
-
-    else
-      local i = string_find(uri, "/", 2, true)
-      output_n = output_n + 1
-
-      if i then
-        local seg = string_sub(uri, 1, i - 1)
-        TMP_OUTPUT[output_n] = seg
-        uri = string_sub(uri, i)
-
-      else
-        TMP_OUTPUT[output_n] = uri
-        uri = ""
-      end
+    if string_find(uri, "//", 1, true) == nil then
+      return uri
     end
   end
 
-  return table_concat(TMP_OUTPUT, "", 1, output_n)
+  -- remove dot segments and possibly merge slashes
+
+  local n -- current index in TMP_OUTPUT
+  local s -- current index to start searching slash from uri
+  local z -- minimum number of TMP_OUTPUT to preserve
+
+  if string_byte(uri, 1) == SLASH_BYTE then
+    -- ensures that the slash prefix is preserved
+    TMP_OUTPUT[1] = SLASH
+    n = 1
+    s = 2
+    z = 1
+
+  else
+    -- no need to preserve any prefix, empty string is fine as result
+    n = 0
+    s = 1
+    z = 0
+  end
+
+  while true do
+    -- find next slash
+    local e = string_find(uri, SLASH, s, true)
+    if not e then
+      -- no slash found means that we have to process the last path segment
+      local b1 = string_byte(uri, s)
+      if b1 == nil then
+        -- the last path segment is empty
+        break
+      end
+
+      if b1 == DOT_BYTE then
+        local b2 = string_byte(uri, s + 1)
+        if b2 == DOT_BYTE then
+          if string_byte(uri, s + 2) == nil then -- ..
+            -- the last path segment is .. which means that the previous segment
+            -- is to be removed in case there is something to remove
+            if n > z then
+              -- remove previous path segment
+              TMP_OUTPUT[n] = nil
+              n = n - 1
+            end
+
+            break
+          end
+
+        elseif b2 == nil then -- .
+          -- the last path segment is . which means that it can be ignored
+          break
+        end
+      end
+
+      -- the last path segment
+      n = n + 1
+      TMP_OUTPUT[n] = string_sub(uri, s, e)
+      break
+    end
+
+    -- slash found
+
+    local c = e - s
+    if c == 0 then -- //
+      -- empty path segment detected
+      if not merge_slashes then
+        -- if the merge_slashes is not enabled the slash is preserved
+        n = n + 1
+        TMP_OUTPUT[n] = SLASH
+      end
+
+    else
+      local b1 = string_byte(uri, s)
+      if c == 1 and b1 == DOT_BYTE then -- /./
+        -- path segment is . which means that it can be ignored
+        goto next
+      end
+
+      if c == 2 and b1 == DOT_BYTE and string_byte(uri, s + 1) == DOT_BYTE then -- /../
+        -- path segment is .. which means that the previous segment is to be
+        -- removed in case there is something to remove
+        if n > z then
+          TMP_OUTPUT[n] = nil
+          n = n - 1
+        end
+
+      else
+
+        -- path segment
+        n = n + 1
+        TMP_OUTPUT[n] = string_sub(uri, s, e) -- path segment
+      end
+    end
+
+    ::next::
+
+    -- increase the next slash search index to be one after the index where
+    -- the previous slash was found
+    s = e + 1
+  end
+
+  if n == 0 then
+    -- in case there is nothing in our output buffer, we will just return empty
+    return EMPTY
+  end
+
+  if n == 1 then
+    -- in case there is just one segment in our output buffer, we can just return it
+    return TMP_OUTPUT[1]
+  end
+
+  -- otherwise we concatenate the output and return that as a normalized uri
+  uri = table_concat(TMP_OUTPUT, nil, 1, n)
+
+  return uri
 end
 
 
 function _M.escape(uri)
-  return ngx_re_gsub(uri, "[^!#$&'()*+,/:;=?@[\\]A-Z\\d-_.~%]", function(m)
-    return string_format("%%%02X", string_byte(m[0]))
-  end, "joi")
+  return ngx_re_gsub(uri, "[^!#$&'()*+,/:;=?@[\\]A-Z\\d-_.~%]", escape, "joi")
 end
 
 
