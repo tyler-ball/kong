@@ -631,6 +631,7 @@ end
 
 
 function Kong.ssl_certificate()
+  -- Note: ctx here is for a connection (not for a single request)
   local ctx = ngx.ctx
 
   kong_global.set_phase(kong, PHASES.certificate)
@@ -644,6 +645,11 @@ function Kong.ssl_certificate()
   local plugins_iterator = runloop.get_updated_plugins_iterator()
   execute_plugins_iterator(plugins_iterator, "certificate", ctx)
   runloop.certificate.after(ctx)
+
+  ngx.ctx = {
+    -- TODO: do we want to keep connection context?
+    -- connection = ngx.ctx
+  }
 end
 
 
